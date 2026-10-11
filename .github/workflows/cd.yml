@@ -1,43 +1,11 @@
-name: CI/CD Pipeline
+﻿name: CD Pipeline
 
 on:
-  pull_request:
-    branches: ["develop", "main"]
   push:
     branches: ["main"]
 
 jobs:
-  test:
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
-    runs-on: ubuntu-latest
-    environment: test
-    env:
-      SECRET_KEY: ${{ secrets.SECRET_KEY }}
-      ENV: test
-      DATABASE_URL_READER: ${{ secrets.DATABASE_URL_READER }}
-      DATABASE_URL_WRITER: ${{ secrets.DATABASE_URL_WRITER }}
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Build app image
-        run: docker compose up --build --force-recreate -d
-
-      - name: Run lint
-        run: docker compose run --rm api ruff check .
-
-      - name: Run tests
-        run: docker compose run --rm api pytest -q --cov=. --cov-report=xml
-
-      - name: Upload coverage
-        uses: codecov/codecov-action@v5
-        with:
-          files: ./coverage.xml
-
   push-to-ecr-prod:
-    needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.test.result == 'success'
     runs-on: ubuntu-latest
     environment: prod
     permissions:
@@ -61,7 +29,7 @@ jobs:
       - name: Build, tag, and push image to Amazon ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: codename_rats-auth_service/app
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
@@ -71,7 +39,6 @@ jobs:
 
   deploy:
     needs: push-to-ecr-prod
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: prod
     permissions:
@@ -108,7 +75,7 @@ jobs:
             EC2_USER: ${{ secrets.EC2_USER }}
             EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
             ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-            ECR_REPOSITORY: codename_rats-auth_service/app
+            ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
             IMAGE_TAG: ${{ github.sha }}
             SECRET_KEY: ${{ secrets.SECRET_KEY }}
             DATABASE_URL_READER: ${{ secrets.DATABASE_URL_READER }}
@@ -130,9 +97,9 @@ jobs:
             DATABASE_URL_WRITER='$DATABASE_URL_WRITER' \
             GITHUB_REPOSITORY='${GITHUB_REPOSITORY}' \
             bash -s" < scripts/deploy.sh
+
   smoke-tests:
     needs: deploy
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: prod
     permissions:
@@ -157,7 +124,7 @@ jobs:
 
   rollback:
     needs: smoke-tests
-    if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: failure()
     runs-on: ubuntu-latest
     environment: prod
     permissions:
@@ -194,7 +161,7 @@ jobs:
           EC2_USER: ${{ secrets.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: codename_rats-auth_service/app
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}

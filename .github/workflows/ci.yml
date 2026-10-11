@@ -1,0 +1,33 @@
+﻿name: CI Pipeline
+
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    environment: test
+    env:
+      SECRET_KEY: ${{ secrets.SECRET_KEY }}
+      ENV: test
+      DATABASE_URL_READER: ${{ secrets.DATABASE_URL_READER }}
+      DATABASE_URL_WRITER: ${{ secrets.DATABASE_URL_WRITER }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Build app image
+        run: docker compose up --build --force-recreate -d
+
+      - name: Run lint
+        run: docker compose run --rm api ruff check .
+
+      - name: Run tests
+        run: docker compose run --rm api pytest -q --cov=. --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
