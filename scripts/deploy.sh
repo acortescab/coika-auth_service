@@ -1,39 +1,76 @@
 #!/bin/bash
-# Deploys IMAGE_TAG on the EC2 host (piped over ssh: `bash -s < scripts/deploy.sh`).
+# Deploys IMAGE_TAG on the API EC2 host (piped over ssh: `bash -s < scripts/deploy.sh`).
+# PostgreSQL runs on its own host and is reached through DATABASE_URL_READER / DATABASE_URL_WRITER;
+# this script only manages the API container.
 #
 # State files in ~/codename_rats-auth_service:
 #   .current-image-tag   tag of the image that is running AND passed the health check
 #   .previous-image-tag  the tag that was current before it (target of rollback.sh)
-#   .last-backup-file    pre-deploy database dump (only set when the dump succeeded)
 set -euo pipefail
 
 # Everything lives in main() so bash parses the whole script before running any of it, and stdin is
-# closed for all commands: when the script is piped over ssh (`bash -s`), a command that reads stdin,
-# such as `docker compose exec -T`, would otherwise swallow the rest of the script and end it silently
-# with exit code 0.
+# closed for all commands: when the script is piped over ssh (`bash -s`), a command that reads stdin
+# would otherwise swallow the rest of the script and end it silently with exit code 0.
 main() {
   exec < /dev/null
 
   : "${ECR_REGISTRY:?ECR_REGISTRY is required}"
   : "${ECR_REPOSITORY:?ECR_REPOSITORY is required}"
   : "${IMAGE_TAG:?IMAGE_TAG is required}"
-  : "${DB_USER:?DB_USER is required}"
-  : "${DB_NAME:?DB_NAME is required}"
 
-  REPO="${GITHUB_REPOSITORY:-acortescab/codename_rats-auth_service}"
+  SSM_PREFIX="${SSM_PREFIX:-/coika/auth_service}"
   HEALTH_URL="${HEALTH_URL:-http://localhost:8000/v0/health/}"
   HEALTH_RETRIES="${HEALTH_RETRIES:-30}"
-  KEEP_BACKUPS="${KEEP_BACKUPS:-5}"
-  COMPOSE="docker compose -f docker-compose-prod.yml"
+  CONTAINER_NAME="api"
 
   mkdir -p ~/codename_rats-auth_service
   cd ~/codename_rats-auth_service
 
-  # Fetch the compose file that belongs to the commit being deployed (IMAGE_TAG is the commit SHA),
-  # not whatever is currently on main.
-  fetch_compose() {
-    curl -fsSL "https://raw.githubusercontent.com/$REPO/$1/docker-compose-prod.yml" -o docker-compose-prod.yml.new
-    mv docker-compose-prod.yml.new docker-compose-prod.yml
+  # Reads the runtime configuration from SSM Parameter Store with the instance role (nothing secret is
+  # sent over ssh or stored on disk). A missing required parameter aborts before the running container
+  # is touched. The OTLP endpoint is optional: empty disables telemetry.
+  load_params() {
+    ssm_get() {
+      aws ssm get-parameter --region eu-west-1 --name "$SSM_PREFIX/$1" --with-decryption \
+        --query Parameter.Value --output text
+    }
+    SECRET_KEY="$(ssm_get app/JWT_PRIVATE_KEY)"
+    OTEL_EXPORTER_OTLP_ENDPOINT="$(ssm_get app/OTEL_EXPORTER_OTLP_ENDPOINT 2> /dev/null || true)"
+
+    # The database URL is built from the db/* parameters (host and port are published by Terraform);
+    # the password is URL-encoded so special characters cannot break the URL.
+    DB_USER="$(ssm_get db/POSTGRES_USER)"
+    DB_PASSWORD="$(ssm_get db/POSTGRES_PASSWORD)"
+    DB_NAME="$(ssm_get db/POSTGRES_DB)"
+    DB_HOST="$(ssm_get db/DB_HOST)"
+    DB_PORT="$(ssm_get db/DB_PORT)"
+    export DB_USER DB_PASSWORD DB_NAME DB_HOST DB_PORT
+    DATABASE_URL_WRITER="$(python3 - <<'PY'
+import os
+from urllib.parse import quote
+e = os.environ
+print(f"postgresql://{quote(e['DB_USER'], safe='')}:{quote(e['DB_PASSWORD'], safe='')}@{e['DB_HOST']}:{e['DB_PORT']}/{e['DB_NAME']}")
+PY
+)"
+    # No read replica yet: the reader uses the same database.
+    DATABASE_URL_READER="$DATABASE_URL_WRITER"
+    unset DB_USER DB_PASSWORD DB_NAME DB_HOST DB_PORT
+    export SECRET_KEY DATABASE_URL_READER DATABASE_URL_WRITER OTEL_EXPORTER_OTLP_ENDPOINT
+  }
+
+  # Replaces the running container with one started from the given tag.
+  run_api() {
+    docker rm -f "$CONTAINER_NAME" > /dev/null 2>&1 || true
+    docker run -d \
+      --name "$CONTAINER_NAME" \
+      --restart unless-stopped \
+      -p 8000:8000 \
+      -e ENV=prod \
+      -e SECRET_KEY \
+      -e DATABASE_URL_READER \
+      -e DATABASE_URL_WRITER \
+      -e OTEL_EXPORTER_OTLP_ENDPOINT \
+      "$ECR_REGISTRY/$ECR_REPOSITORY:$1"
   }
 
   wait_healthy() {
@@ -53,28 +90,10 @@ main() {
     PREVIOUS_TAG="$(cat .current-image-tag)"
   fi
 
-  # Backup the database before touching anything. A failed dump must not leave a stale pointer behind,
-  # otherwise a later rollback could restore an unrelated, older dump.
-  rm -f .last-backup-file
-  if [ -f docker-compose-prod.yml ] && [ -n "$PREVIOUS_TAG" ]; then
-    mkdir -p backups
-    BACKUP_FILE="backups/db_backup_$(date +%s).sql"
-    echo "Info: Creating database backup at $BACKUP_FILE"
-    if $COMPOSE exec -T db pg_dump -U "$DB_USER" -d "$DB_NAME" > "$BACKUP_FILE" && [ -s "$BACKUP_FILE" ]; then
-      echo "$BACKUP_FILE" > .last-backup-file
-    else
-      echo "Warning: Database backup failed; continuing without a backup"
-      rm -f "$BACKUP_FILE"
-    fi
-    # keep only the newest backups
-    (ls -1t backups/db_backup_*.sql 2>/dev/null || true) | tail -n +"$((KEEP_BACKUPS + 1))" | xargs -r rm -f --
-  fi
-
-  export IMAGE_TAG
   echo "Info: Deploying image tag $IMAGE_TAG"
-  fetch_compose "$IMAGE_TAG"
-  $COMPOSE pull api
-  $COMPOSE up -d
+  load_params
+  docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+  run_api "$IMAGE_TAG"
 
   if wait_healthy; then
     if [ -n "$PREVIOUS_TAG" ] && [ "$PREVIOUS_TAG" != "$IMAGE_TAG" ]; then
@@ -86,14 +105,12 @@ main() {
   fi
 
   echo "Error: $IMAGE_TAG did not become healthy at $HEALTH_URL"
-  $COMPOSE logs --tail 50 api || true
+  docker logs --tail 50 "$CONTAINER_NAME" || true
 
   # Put the last known-good image back (image only; the database is left untouched).
   if [ -n "$PREVIOUS_TAG" ]; then
     echo "Info: Reverting to previous image $PREVIOUS_TAG"
-    export IMAGE_TAG="$PREVIOUS_TAG"
-    fetch_compose "$PREVIOUS_TAG"
-    $COMPOSE up -d
+    run_api "$PREVIOUS_TAG"
     if wait_healthy; then
       echo "Info: Previous image $PREVIOUS_TAG is healthy again"
     else

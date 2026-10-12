@@ -61,7 +61,7 @@ jobs:
 
       - name: Setup SSH
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST: ${{ vars.EC2_HOST }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
@@ -71,31 +71,19 @@ jobs:
 
       - name: Connect SSH and deploy
         env:
-            EC2_HOST: ${{ secrets.EC2_HOST }}
-            EC2_USER: ${{ secrets.EC2_USER }}
+            EC2_HOST: ${{ vars.EC2_HOST }}
+            EC2_USER: ${{ vars.EC2_USER }}
             EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
             ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
             ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
             IMAGE_TAG: ${{ github.sha }}
-            SECRET_KEY: ${{ secrets.SECRET_KEY }}
-            DATABASE_URL_READER: ${{ secrets.DATABASE_URL_READER }}
-            DATABASE_URL_WRITER: ${{ secrets.DATABASE_URL_WRITER }}
-            DB_USER: ${{ secrets.DB_USER }}
-            DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-            DB_NAME: ${{ secrets.DB_NAME }}
         run: |
+          # Runtime config (SECRET_KEY, DATABASE_URL_*) is read from SSM Parameter Store on the host.
           chmod +x scripts/deploy.sh
           ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" \
             "ECR_REGISTRY='$ECR_REGISTRY' \
             ECR_REPOSITORY='$ECR_REPOSITORY' \
             IMAGE_TAG='$IMAGE_TAG' \
-            DB_USER='$DB_USER' \
-            DB_PASSWORD='$DB_PASSWORD' \
-            DB_NAME='$DB_NAME' \
-            SECRET_KEY='$SECRET_KEY' \
-            DATABASE_URL_READER='$DATABASE_URL_READER' \
-            DATABASE_URL_WRITER='$DATABASE_URL_WRITER' \
-            GITHUB_REPOSITORY='${GITHUB_REPOSITORY}' \
             bash -s" < scripts/deploy.sh
 
   smoke-tests:
@@ -147,7 +135,7 @@ jobs:
 
       - name: Setup SSH
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_HOST: ${{ vars.EC2_HOST }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
@@ -157,27 +145,14 @@ jobs:
 
       - name: Connect SSH and rollback
         env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_HOST: ${{ vars.EC2_HOST }}
+          EC2_USER: ${{ vars.EC2_USER }}
           EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
-          DB_USER: ${{ secrets.DB_USER }}
-          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
-          DB_NAME: ${{ secrets.DB_NAME }}
-          SECRET_KEY: ${{ secrets.SECRET_KEY }}
-          DATABASE_URL_READER: ${{ secrets.DATABASE_URL_READER }}
-          DATABASE_URL_WRITER: ${{ secrets.DATABASE_URL_WRITER }}
         run: |
           chmod +x scripts/rollback.sh
           ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" \
             "ECR_REGISTRY='$ECR_REGISTRY' \
             ECR_REPOSITORY='$ECR_REPOSITORY' \
-            DB_USER='$DB_USER' \
-            DB_PASSWORD='$DB_PASSWORD' \
-            DB_NAME='$DB_NAME' \
-            SECRET_KEY='$SECRET_KEY' \
-            DATABASE_URL_READER='$DATABASE_URL_READER' \
-            DATABASE_URL_WRITER='$DATABASE_URL_WRITER' \
-            GITHUB_REPOSITORY='${GITHUB_REPOSITORY}' \
             bash -s" < scripts/rollback.sh
