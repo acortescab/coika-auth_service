@@ -128,7 +128,7 @@ The application reads these values at startup through the settings loader in `ap
 
 In `dev`, `SECRET_KEY` is loaded automatically from `secrets/private_key.pem`, so you do not need to set it in `.env`.
 
-If you set `ENV` to a non-dev value, `SECRET_KEY` must be an RSA private key in PEM format (multi-line) in github secrets, because tokens are signed with `RS256`.
+If you set `ENV` to a non-dev value, `SECRET_KEY` must be an RSA private key in PEM format (multi-line), because tokens are signed with `RS256`. In production it comes from AWS SSM Parameter Store (see [Production](#production)).
 
 ### 2. Start the development stack
 
@@ -256,7 +256,7 @@ was linked to an email with `/link-account`).
 
 - Keep `SECRET_KEY` private and never commit it to source control.
 - Use environment variables or a local `.env` file for development only.
-- In production, rotate credentials and use secure environment configuration.
+- In production, secrets live in AWS SSM Parameter Store and are never stored in GitHub secrets or on disk.
 
 ## License
 
@@ -264,13 +264,54 @@ This project is licensed under the terms described in the repository license fil
 
 ## CI/CD
 
-The repository includes a GitHub Actions workflow at `.github/workflows/ci_tests.yml` that checks the project on pull requests to `develop` and `main`.
-
-The workflow:
+`.github/workflows/ci.yml` checks pull requests to `main`:
 
 - builds the application image
 - runs `ruff check .`
 - runs `pytest -q --cov=. --cov-report=xml`
 
-This matches the Docker Compose setup used by the service and keeps CI aligned with the local runtime configuration.
+This matches the Docker Compose setup used for local development and keeps CI aligned with it.
+
+`.github/workflows/cd.yml` runs on every push to `main`: it builds and pushes the image to ECR (tagged with the
+commit SHA and `latest`), deploys it to the API host over SSH with `scripts/deploy.sh`, runs the smoke tests
+and, if they fail, runs `scripts/rollback.sh`.
+
+GitHub configuration of the `prod` environment:
+
+- Secrets: `AWS_ROLE_ARN`, `EC2_SSH_KEY`
+- Variables: `ECR_REPOSITORY`, `EC2_HOST`, `EC2_USER`, `PROD_URL`
+
+## Production
+
+Docker Compose is only used for local development and CI. In production there are two EC2 hosts, both
+provisioned by the infrastructure repository (`codename_rats-auth_service-infra`):
+
+- **API host**: runs a single container (`api`) started with `docker run` by `scripts/deploy.sh`. There is no
+  production compose file.
+- **Database host**: PostgreSQL in its own EC2 with a dedicated EBS volume. How to start it and how its
+  backups to S3 work is documented in the infrastructure repository (`db/README.md`).
+
+### Configuration (SSM Parameter Store)
+
+The API host reads its configuration at deploy time with its instance role, so the deploy sends no secret over
+SSH. Prefix `/coika/auth_service` (override with `SSM_PREFIX`):
+
+| Parameter | Used for |
+| --- | --- |
+| `app/JWT_PRIVATE_KEY` | `SECRET_KEY` (RSA private key in PEM) |
+| `app/OTEL_EXPORTER_OTLP_ENDPOINT` | optional; without it telemetry is disabled |
+| `db/POSTGRES_USER`, `db/POSTGRES_PASSWORD`, `db/POSTGRES_DB` | credentials shared with the database host |
+| `db/DB_HOST`, `db/DB_PORT` | created by Terraform; address of the database host |
+
+`DATABASE_URL_WRITER` and `DATABASE_URL_READER` are built by the deploy script from the `db/*` parameters (the
+password is URL-encoded). There is no read replica yet, so both point to the same database. A missing required
+parameter aborts the deploy before the running container is touched.
+
+### Deploy and rollback
+
+- `scripts/deploy.sh` pulls the image, replaces the `api` container and waits for `/v0/health/`. If the new
+  image is not healthy it puts the previous one back. The state lives in `~/codename_rats-auth_service`
+  (`.current-image-tag`, `.previous-image-tag`).
+- `scripts/rollback.sh` redeploys the previous image. It never touches the database: the dumps live in S3 and
+  are restored on the database host (`restore.sh` in the infrastructure repository).
 

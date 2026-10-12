@@ -1,28 +1,23 @@
 #!/bin/bash
-# Rolls the running deployment back to the previous image (piped over ssh: `bash -s < scripts/rollback.sh`).
+# Rolls the API container back to the previous image (piped over ssh: `bash -s < scripts/rollback.sh`).
 #
-# By default only the image is rolled back; the database is left as it is, so no user data is lost.
-# Set RESTORE_DB=1 to also restore the pre-deploy dump (.last-backup-file). Do that only when the failed
-# release ran a destructive migration: everything written since that dump is discarded.
+# Only the image is rolled back; the database lives on its own host and is left as it is, so no user
+# data is lost. If a failed release ran a destructive migration, restore the dump on the DB host.
 set -euo pipefail
 
 # Everything lives in main() so bash parses the whole script before running any of it, and stdin is
-# closed for all commands: when the script is piped over ssh (`bash -s`), a command that reads stdin,
-# such as `docker compose exec -T`, would otherwise swallow the rest of the script and end it silently
-# with exit code 0.
+# closed for all commands: when the script is piped over ssh (`bash -s`), a command that reads stdin
+# would otherwise swallow the rest of the script and end it silently with exit code 0.
 main() {
   exec < /dev/null
 
   : "${ECR_REGISTRY:?ECR_REGISTRY is required}"
   : "${ECR_REPOSITORY:?ECR_REPOSITORY is required}"
-  : "${DB_USER:?DB_USER is required}"
-  : "${DB_NAME:?DB_NAME is required}"
 
-  REPO="${GITHUB_REPOSITORY:-acortescab/codename_rats-auth_service}"
+  SSM_PREFIX="${SSM_PREFIX:-/coika/auth_service}"
   HEALTH_URL="${HEALTH_URL:-http://localhost:8000/v0/health/}"
   HEALTH_RETRIES="${HEALTH_RETRIES:-30}"
-  RESTORE_DB="${RESTORE_DB:-0}"
-  COMPOSE="docker compose -f docker-compose-prod.yml"
+  CONTAINER_NAME="api"
 
   mkdir -p ~/codename_rats-auth_service
   cd ~/codename_rats-auth_service
@@ -43,41 +38,44 @@ main() {
 
   echo "Info: Rolling back to image: $ROLLBACK_TAG"
 
-  # Use the compose file from the release being restored.
-  curl -fsSL "https://raw.githubusercontent.com/$REPO/$ROLLBACK_TAG/docker-compose-prod.yml" -o docker-compose-prod.yml.new
-  mv docker-compose-prod.yml.new docker-compose-prod.yml
+  # Runtime configuration from SSM Parameter Store (instance role). OTLP endpoint is optional.
+  ssm_get() {
+    aws ssm get-parameter --region eu-west-1 --name "$SSM_PREFIX/$1" --with-decryption \
+      --query Parameter.Value --output text
+  }
+  SECRET_KEY="$(ssm_get app/JWT_PRIVATE_KEY)"
+  OTEL_EXPORTER_OTLP_ENDPOINT="$(ssm_get app/OTEL_EXPORTER_OTLP_ENDPOINT 2> /dev/null || true)"
 
-  if [ "$RESTORE_DB" = "1" ]; then
-    BACKUP_FILE=""
-    [ -f .last-backup-file ] && BACKUP_FILE="$(cat .last-backup-file)"
+  # Same URL construction as deploy.sh: db/* parameters, password URL-encoded.
+  DB_USER="$(ssm_get db/POSTGRES_USER)"
+  DB_PASSWORD="$(ssm_get db/POSTGRES_PASSWORD)"
+  DB_NAME="$(ssm_get db/POSTGRES_DB)"
+  DB_HOST="$(ssm_get db/DB_HOST)"
+  DB_PORT="$(ssm_get db/DB_PORT)"
+  export DB_USER DB_PASSWORD DB_NAME DB_HOST DB_PORT
+  DATABASE_URL_WRITER="$(python3 - <<'PY'
+import os
+from urllib.parse import quote
+e = os.environ
+print(f"postgresql://{quote(e['DB_USER'], safe='')}:{quote(e['DB_PASSWORD'], safe='')}@{e['DB_HOST']}:{e['DB_PORT']}/{e['DB_NAME']}")
+PY
+)"
+  DATABASE_URL_READER="$DATABASE_URL_WRITER"
+  unset DB_USER DB_PASSWORD DB_NAME DB_HOST DB_PORT
+  export SECRET_KEY DATABASE_URL_READER DATABASE_URL_WRITER OTEL_EXPORTER_OTLP_ENDPOINT
 
-    if [ -z "$BACKUP_FILE" ] || [ ! -f "$BACKUP_FILE" ]; then
-      echo "Error: RESTORE_DB=1 but no valid backup file was found; aborting before changing anything."
-      exit 1
-    fi
-
-    echo "Info: Restoring database from: $BACKUP_FILE (data written since this dump will be lost)"
-    export IMAGE_TAG="$ROLLBACK_TAG"
-    $COMPOSE stop api
-    $COMPOSE up -d db
-
-    for _ in $(seq 1 30); do
-      $COMPOSE exec -T db pg_isready -U "$DB_USER" -d "$DB_NAME" > /dev/null 2>&1 && break
-      sleep 2
-    done
-
-    # Restore into a clean schema through a single transaction so a bad dump does not leave a half-restored DB.
-    $COMPOSE exec -T db psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 \
-      -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
-    $COMPOSE exec -T db psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 --single-transaction < "$BACKUP_FILE"
-    echo "Success: Database restored"
-  else
-    echo "Info: Leaving the database untouched (set RESTORE_DB=1 to restore the last backup)"
-  fi
-
-  export IMAGE_TAG="$ROLLBACK_TAG"
-  $COMPOSE pull api
-  $COMPOSE up -d
+  docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$ROLLBACK_TAG"
+  docker rm -f "$CONTAINER_NAME" > /dev/null 2>&1 || true
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    -p 8000:8000 \
+    -e ENV=prod \
+    -e SECRET_KEY \
+    -e DATABASE_URL_READER \
+    -e DATABASE_URL_WRITER \
+    -e OTEL_EXPORTER_OTLP_ENDPOINT \
+    "$ECR_REGISTRY/$ECR_REPOSITORY:$ROLLBACK_TAG"
 
   for _ in $(seq 1 "$HEALTH_RETRIES"); do
     if curl -fsS "$HEALTH_URL" > /dev/null 2>&1; then
@@ -91,7 +89,7 @@ main() {
   done
 
   echo "Error: $ROLLBACK_TAG did not become healthy after rollback; manual intervention required"
-  $COMPOSE logs --tail 50 api || true
+  docker logs --tail 50 "$CONTAINER_NAME" || true
   exit 1
 }
 

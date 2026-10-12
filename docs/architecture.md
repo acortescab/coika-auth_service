@@ -25,7 +25,7 @@ flowchart LR
     subgraph Infra[Infrastructure]
         Config[Settings & Config\napp/core/config.py]
         Migrations[Alembic Migrations\nalembic/versions]
-        Docker[Docker Compose / Containers]
+        Docker["Docker Compose (dev/CI) / API container (prod)"]
     end
 
     Client -->|HTTP requests| Router
@@ -70,6 +70,31 @@ This service is a FastAPI authentication backend for the Coika platform. It hand
 - Model layer: SQLAlchemy persistence models in app/db/models
 - Core layer: settings, JWT helpers, and exception handling in app/core
 - Infrastructure layer: PostgreSQL, Docker, and Alembic migration tooling
+
+## Production deployment
+
+```mermaid
+flowchart LR
+    GH[GitHub Actions\nci.yml / cd.yml] -->|push image| ECR[(ECR)]
+    GH -->|ssh: deploy.sh / rollback.sh| API
+    subgraph VPC
+        API[API host\nEC2, api container :8000]
+        PG[Database host\nEC2, PostgreSQL :5432\nEBS data volume]
+    end
+    API -->|DATABASE_URL_*| PG
+    API -.->|read config at deploy| SSM[SSM Parameter Store\n/coika/auth_service]
+    PG -.->|read credentials| SSM
+    API -->|pull image| ECR
+    PG -->|pg_dump cron| S3[(S3 snapshots\nversioned, DR replica)]
+```
+
+- Docker Compose is used only for local development and CI. Production has no compose file: the API host runs
+  one container started with `docker run` by `scripts/deploy.sh`.
+- PostgreSQL runs on its own EC2 host (private subnet, data on a dedicated EBS volume). Only the API host can reach
+  its port, and backups go to S3 (the infrastructure repository documents both).
+- Secrets and configuration are read from SSM Parameter Store with the instance roles. The deploy builds
+  `DATABASE_URL_*` from the `db/*` parameters, so credentials are stored once and never travel over SSH.
+- Rollback only redeploys the previous image; data is restored explicitly on the database host.
 
 ## Request flow
 
