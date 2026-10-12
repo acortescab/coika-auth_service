@@ -60,6 +60,10 @@ PY
 
   # Replaces the running container with one started from the given tag.
   run_api() {
+    # Migration from the old docker compose stack: its api container still holds port 8000. Only the api
+    # service is removed; the old db container and its volume are left alone (nothing is deleted with data).
+    docker ps -aq --filter "label=com.docker.compose.project=codename_rats-auth_service" \
+      --filter "label=com.docker.compose.service=api" | xargs -r docker rm -f > /dev/null
     docker rm -f "$CONTAINER_NAME" > /dev/null 2>&1 || true
     docker run -d \
       --name "$CONTAINER_NAME" \
