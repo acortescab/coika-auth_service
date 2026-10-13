@@ -85,6 +85,8 @@ services:
       DATABASE_URL_WRITER: ${DATABASE_URL_WRITER}
       # Empty disables telemetry. Local .env sets it to http://otel-collector:4317 next to COMPOSE_PROFILES.
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      # Standard OTel resource attributes, merged by the SDK into every trace, metric and log.
+      OTEL_RESOURCE_ATTRIBUTES: game.name=Coika
     depends_on:
       db:
         condition: service_healthy

@@ -312,6 +312,12 @@ parameter aborts the deploy before the running container is touched.
 - `scripts/deploy.sh` pulls the image, replaces the `api` container and waits for `/v0/health/`. If the new
   image is not healthy it puts the previous one back. The state lives in `~/codename_rats-auth_service`
   (`.current-image-tag`, `.previous-image-tag`).
+- Migrations run in `deploy.sh` as a one-off `alembic upgrade head` container from the new image, before the
+  API is replaced (production sets `RUN_MIGRATIONS=false`; dev/compose still migrates on start). If they fail,
+  the running release is not touched.
 - `scripts/rollback.sh` redeploys the previous image. It never touches the database: the dumps live in S3 and
   are restored on the database host (`restore.sh` in the infrastructure repository).
+- Put `[destructive]` in the message of any migration that loses data or breaks the previous image
+  (`make migrate msg="drop players.x [destructive]"`). `deploy.sh` then writes `.destructive-migration` and
+  `rollback.sh` refuses to roll the image back until the DB is restored and that file is removed.
 

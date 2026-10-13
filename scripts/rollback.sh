@@ -27,6 +27,14 @@ main() {
     exit 1
   fi
 
+  # Image-only rollback is safe for additive migrations. A [destructive] one (see deploy.sh) needs the DB
+  # restored first, otherwise the old image would run against a schema it does not understand.
+  if [ -f .destructive-migration ]; then
+    echo "Error: $(cat .destructive-migration) ran a [destructive] migration; image rollback is not safe."
+    echo "Restore the DB dump on the DB host, then rm ~/codename_rats-auth_service/.destructive-migration and re-run the rollback."
+    exit 1
+  fi
+
   ROLLBACK_TAG="$(cat .previous-image-tag)"
 
   if [ -z "$ROLLBACK_TAG" ]; then
@@ -71,10 +79,12 @@ PY
     --restart unless-stopped \
     -p 8000:8000 \
     -e ENV=prod \
+    -e RUN_MIGRATIONS=false \
     -e SECRET_KEY \
     -e DATABASE_URL_READER \
     -e DATABASE_URL_WRITER \
     -e OTEL_EXPORTER_OTLP_ENDPOINT \
+    -e OTEL_RESOURCE_ATTRIBUTES=game.name=Coika \
     "$ECR_REGISTRY/$ECR_REPOSITORY:$ROLLBACK_TAG"
 
   for _ in $(seq 1 "$HEALTH_RETRIES"); do

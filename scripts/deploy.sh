@@ -70,10 +70,12 @@ PY
       --restart unless-stopped \
       -p 8000:8000 \
       -e ENV=prod \
+      -e RUN_MIGRATIONS=false \
       -e SECRET_KEY \
       -e DATABASE_URL_READER \
       -e DATABASE_URL_WRITER \
       -e OTEL_EXPORTER_OTLP_ENDPOINT \
+      -e OTEL_RESOURCE_ATTRIBUTES=game.name=Coika \
       "$ECR_REGISTRY/$ECR_REPOSITORY:$1"
   }
 
@@ -97,6 +99,36 @@ PY
   echo "Info: Deploying image tag $IMAGE_TAG"
   load_params
   docker pull "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  # Migrations run as a one-off container from the new image BEFORE the running API is touched: if they
+  # fail, the current release keeps serving. A pending revision whose message contains "[destructive]"
+  # (data loss or a schema the previous image cannot work with) marks the release, so rollback.sh refuses
+  # to put the old image back on top of it.
+  run_alembic() {
+    docker run --rm --entrypoint alembic \
+      -e ENV=prod \
+      -e SECRET_KEY \
+      -e DATABASE_URL_READER \
+      -e DATABASE_URL_WRITER \
+      "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" "$@"
+  }
+
+  FROM_REV="$(run_alembic current 2> /dev/null | grep -oE '^[0-9a-f]{12}' | head -n 1 || true)"
+  PENDING="$(run_alembic history -r "${FROM_REV:-base}:head" 2> /dev/null || true)"
+
+  echo "Info: Applying database migrations (from ${FROM_REV:-base})"
+  if ! run_alembic upgrade head; then
+    echo "Error: Migrations failed; the running release was not touched"
+    exit 1
+  fi
+
+  if grep -q '\[destructive\]' <<< "$PENDING"; then
+    echo "$IMAGE_TAG" > .destructive-migration
+    echo "Warning: $IMAGE_TAG applied a [destructive] migration; automatic image rollback is disabled"
+  else
+    rm -f .destructive-migration
+  fi
+
   run_api "$IMAGE_TAG"
 
   if wait_healthy; then
@@ -112,7 +144,9 @@ PY
   docker logs --tail 50 "$CONTAINER_NAME" || true
 
   # Put the last known-good image back (image only; the database is left untouched).
-  if [ -n "$PREVIOUS_TAG" ]; then
+  if [ -f .destructive-migration ]; then
+    echo "Error: $IMAGE_TAG ran a [destructive] migration; not reverting the image. Restore the DB dump on the DB host, then rm ~/codename_rats-auth_service/.destructive-migration and redeploy"
+  elif [ -n "$PREVIOUS_TAG" ]; then
     echo "Info: Reverting to previous image $PREVIOUS_TAG"
     run_api "$PREVIOUS_TAG"
     if wait_healthy; then
