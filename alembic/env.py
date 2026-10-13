@@ -22,7 +22,6 @@ load_models()
 
 # setup database url
 config.set_main_option("sqlalchemy.url", os.getenv("DATABASE_URL_WRITER"))
-print("ALEMBIC DB URL:", config.get_main_option("sqlalchemy.url"))
 
 # add your model's MetaData object here
 # for 'autogenerate' support
